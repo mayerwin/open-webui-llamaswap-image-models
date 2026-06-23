@@ -3,7 +3,7 @@ title: Image Generation (llama-swap)
 author: mayerwin
 author_url: https://github.com/mayerwin/open-webui-llamaswap-image-models
 funding_url: https://github.com/mayerwin/open-webui-llamaswap-image-models
-version: 1.0.0
+version: 1.0.1
 license: MIT
 description: Image-generation models routed through llama-swap, as selectable Open WebUI models.
 required_open_webui_version: 0.5.0
@@ -276,8 +276,28 @@ class Pipe:
                 return base64.b64encode(await ir.read()).decode(), None
         return None, "no image in response"
 
+    @staticmethod
+    def _is_task(body, task, metadata):
+        # Open WebUI runs background tasks (title / tags / follow-up / query / autocomplete
+        # generation) against the *currently selected* model when no dedicated task model is
+        # configured. For an image model that renders a throwaway image per task: slow, it
+        # keeps the GPU busy long after the real image, and the chat keeps "spinning". So we
+        # detect a task call and skip it. The signal is exposed differently across Open WebUI
+        # versions, so check all of them.
+        if task:
+            return True
+        for src in (metadata, (body or {}).get("metadata") if isinstance(body, dict) else None):
+            if isinstance(src, dict) and src.get("task"):
+                return True
+        return False
+
     # ---- entrypoint --------------------------------------------------------
-    async def pipe(self, body, __user__=None, __event_emitter__=None, __request__=None):
+    async def pipe(self, body, __user__=None, __event_emitter__=None, __request__=None,
+                   __task__=None, __metadata__=None):
+        if self._is_task(body, __task__, __metadata__):
+            # Not a user image request; return nothing so Open WebUI falls back gracefully
+            # (the chat title defaults to the prompt, no extra render is queued).
+            return ""
         mid = (body.get("model") or "").split(".", 1)[-1]
         cfg = next((m for m in self._models() if m["id"] == mid), None)
         if not cfg:
