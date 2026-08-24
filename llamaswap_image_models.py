@@ -3,9 +3,9 @@ title: Image Generation (llama-swap)
 author: mayerwin
 author_url: https://github.com/mayerwin/open-webui-llamaswap-image-models
 funding_url: https://github.com/mayerwin/open-webui-llamaswap-image-models
-version: 1.0.1
+version: 1.1.0
 license: MIT
-description: Image-generation models routed through llama-swap, as selectable Open WebUI models.
+description: Image-generation models routed through llama-swap, as selectable Open WebUI models. Images are stored in Open WebUI's file store so chats stay fast.
 required_open_webui_version: 0.5.0
 """
 # (Kept out of the YAML frontmatter above, which only allows single-line values.)
@@ -22,8 +22,14 @@ required_open_webui_version: 0.5.0
 #
 # PORTABILITY: the only thing to change on another machine is the Valves --
 # LLAMASWAP_URL and MODELS_JSON. MODELS_JSON maps each llama-swap image model to
-# a built-in workflow template (flux2 / qwen_image / hidream) plus its file names,
+# a built-in workflow template (flux2 / qwen_image / hidream / sdxl) plus its file names,
 # or marks it backend "openai". No code changes for the common cases.
+#
+# IMAGE DELIVERY: the generated image is uploaded to Open WebUI's own file store
+# and referenced by URL. Returning a base64 data URI instead (the 1.0 behaviour,
+# still available via the INLINE_IMAGES valve) re-sends the whole image with
+# every later message in the chat, which makes an image-heavy chat slow to load
+# and painful to keep talking in.
 
 import json
 import re
@@ -79,7 +85,20 @@ def _wf_hidream(files, prompt, negative, w, h, steps, guidance, seed):
     }
 
 
-TEMPLATES = {"flux2": _wf_flux2, "qwen_image": _wf_qwen_image, "hidream": _wf_hidream}
+def _wf_sdxl(files, prompt, negative, w, h, steps, guidance, seed):
+    # Stock SD/SDXL checkpoint graph (one .safetensors holding unet+clip+vae).
+    return {
+        "4": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": files["ckpt"]}},
+        "5": {"class_type": "EmptyLatentImage", "inputs": {"width": w, "height": h, "batch_size": 1}},
+        "6": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["4", 1], "text": prompt}},
+        "7": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["4", 1], "text": negative or "text, watermark"}},
+        "41": {"class_type": "KSampler", "inputs": {"model": ["4", 0], "positive": ["6", 0], "negative": ["7", 0], "latent_image": ["5", 0], "seed": seed, "steps": steps, "cfg": guidance or 7.0, "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0}},
+        "42": {"class_type": "VAEDecode", "inputs": {"samples": ["41", 0], "vae": ["4", 2]}},
+        "43": {"class_type": "SaveImage", "inputs": {"images": ["42", 0], "filename_prefix": "owui"}},
+    }
+
+
+TEMPLATES = {"flux2": _wf_flux2, "qwen_image": _wf_qwen_image, "hidream": _wf_hidream, "sdxl": _wf_sdxl}
 
 # Palette emoji as a module constant -- NOT inline in any f-string, because Open
 # WebUI may run Python < 3.12 where a backslash inside an f-string expression is a
@@ -134,7 +153,15 @@ class Pipe:
         MODELS_JSON: str = Field(
             default=json.dumps(DEFAULT_MODELS, indent=1),
             description="JSON list of image models to expose. Each maps a llama-swap model to a "
-                        "workflow template (flux2/qwen_image/hidream) + files, or backend 'openai'.")
+                        "workflow template (flux2/qwen_image/hidream/sdxl) + files, or backend 'openai'.")
+        WEBUI_URL: str = Field(
+            default="",
+            description="Base URL of this Open WebUI instance, used to upload the generated image "
+                        "to its file store. Leave empty to auto-detect it from the incoming request.")
+        INLINE_IMAGES: bool = Field(
+            default=False,
+            description="Return the image as an inline base64 data URI instead of a file-store link. "
+                        "Needs no auth, but bloats the chat and slows it down badly over time.")
         TIMEOUT_S: int = Field(default=2400, description="Max seconds to wait for one image (heavy models are slow).")
 
     class UserValves(BaseModel):
@@ -170,6 +197,27 @@ class Pipe:
         return out
 
     # ---- helpers -----------------------------------------------------------
+    @staticmethod
+    def _collect_images(outputs):
+        # ComfyUI reports a node's outputs in more than one shape depending on its
+        # version and on whether asset enrichment (--enable-assets) is on: a plain
+        # {"images": [...]}, the same nested under "ui", or a list of such dicts.
+        # Accept all of them, otherwise a perfectly good render looks like "no image".
+        imgs = []
+        for n in outputs.values():
+            if isinstance(n, list):
+                for item in n:
+                    if isinstance(item, dict):
+                        imgs.extend(item.get("images") or [])
+                continue
+            if not isinstance(n, dict):
+                continue
+            imgs.extend(n.get("images") or [])
+            ui = n.get("ui")
+            if isinstance(ui, dict):
+                imgs.extend(ui.get("images") or [])
+        return [im for im in imgs if isinstance(im, dict) and im.get("filename")]
+
     @staticmethod
     def _last_prompt(body):
         for msg in reversed(body.get("messages", [])):
@@ -231,10 +279,12 @@ class Pipe:
                 async with s.get(f"{up}/history/{pid}") as hr:
                     hist = await hr.json() if hr.status == 200 else {}
             except Exception:
+                # keep the timer moving so a transient poll failure does not look like a hang
+                await self._emit(emitter, f"rendering on the GPU... {int(time.time() - t0)}s")
                 continue
             if pid in hist:
                 outs = hist[pid].get("outputs", {})
-                imgs = [im for n in outs.values() for im in n.get("images", [])]
+                imgs = self._collect_images(outs)
                 if not imgs:
                     return None, str(hist[pid].get("status", "no image produced"))[:200]
                 im = imgs[0]
@@ -246,7 +296,7 @@ class Pipe:
                     raw = await vr.read()
                 if not raw:
                     return None, "ComfyUI returned an empty image"
-                return base64.b64encode(raw).decode(), None
+                return raw, None
             await self._emit(emitter, f"rendering on the GPU... {int(time.time() - t0)}s")
         # timed out: best-effort cancel so the next request isn't stuck behind it
         try:
@@ -268,13 +318,87 @@ class Pipe:
             return None, "no image in response"
         data = arr[0]
         if data.get("b64_json"):
-            return data["b64_json"], None
+            try:
+                return base64.b64decode(data["b64_json"]), None
+            except Exception as e:
+                return None, f"bad base64 in response: {e}"
         if data.get("url"):
             async with s.get(data["url"]) as ir:
                 if ir.status != 200:
                     return None, f"fetch image url {ir.status}"
-                return base64.b64encode(await ir.read()).decode(), None
+                return await ir.read(), None
         return None, "no image in response"
+
+    # ---- delivery ----------------------------------------------------------
+    @staticmethod
+    def _auth_headers(request):
+        # Open WebUI's file API needs the caller's credentials; reuse whatever the
+        # incoming request carried (an Authorization header, or the session cookie).
+        headers = {}
+        if request is None:
+            return headers
+        try:
+            auth = request.headers.get("authorization")
+        except Exception:
+            auth = None
+        try:
+            token = request.cookies.get("token")
+        except Exception:
+            token = None
+        if auth:
+            headers["Authorization"] = auth
+        if token:
+            headers["Cookie"] = f"token={token}"
+            headers.setdefault("Authorization", f"Bearer {token}")
+        return headers
+
+    async def _upload_to_webui(self, s, raw, prompt, request, metadata):
+        base = (self.valves.WEBUI_URL or "").rstrip("/")
+        if not base and request is not None:
+            try:
+                base = str(request.base_url).rstrip("/")
+            except Exception:
+                base = ""
+        if not base:
+            return None, "WEBUI_URL is empty and could not be auto-detected"
+        meta = metadata if isinstance(metadata, dict) else {}
+        try:
+            form = aiohttp.FormData()
+            form.add_field("file", raw, filename=f"image-{int(time.time())}.png", content_type="image/png")
+            form.add_field("metadata", json.dumps({
+                "prompt": prompt[:500],
+                "chat_id": meta.get("chat_id", ""),
+                "message_id": meta.get("message_id", ""),
+            }))
+            # Two details make this work, and getting either wrong is what made the
+            # file store look unusable before:
+            #   - the trailing slash: the route is POST /api/v1/files/ , and without
+            #     it the request lands on the GET listing and comes back 405;
+            #   - process=false: skips the document-extraction pipeline, which is
+            #     what hangs on an image.
+            url = f"{base}/api/v1/files/?process=false"
+            async with s.post(url, data=form, headers=self._auth_headers(request)) as r:
+                if r.status != 200:
+                    return None, f"{r.status}: {(await r.text())[:200]}"
+                fid = (await r.json()).get("id")
+            if not fid:
+                return None, "upload returned no file id"
+            # Relative on purpose: the browser resolves it against the Open WebUI
+            # origin it is already on, so this works from any network.
+            return f"/api/v1/files/{fid}/content", None
+        except Exception as e:
+            return None, f"{type(e).__name__}: {e}"
+
+    async def _deliver(self, s, raw, prompt, request, metadata):
+        # Returns (image_src, warning). File store first, data URI as a fallback so
+        # a slow render is never thrown away just because the upload failed.
+        warn = None
+        if not self.valves.INLINE_IMAGES:
+            url, uerr = await self._upload_to_webui(s, raw, prompt, request, metadata)
+            if url:
+                return url, None
+            warn = f"file store upload failed ({uerr}), sent inline instead"
+        return "data:image/png;base64," + base64.b64encode(raw).decode(), warn
 
     @staticmethod
     def _is_task(body, task, metadata):
@@ -312,22 +436,27 @@ class Pipe:
 
         await self._emit(__event_emitter__, f"Loading {cfg.get('name', mid)} via llama-swap...")
         t0 = time.time()
-        img = err = None
+        raw = err = src = warn = None
         try:
             timeout = aiohttp.ClientTimeout(total=self.valves.TIMEOUT_S + 120)
             async with aiohttp.ClientSession(timeout=timeout) as s:
                 if cfg.get("backend") == "openai":
-                    img, err = await self._openai(s, self.valves.LLAMASWAP_URL, cfg, prompt, w, h, seed)
+                    raw, err = await self._openai(s, self.valves.LLAMASWAP_URL, cfg, prompt, w, h, seed)
                 else:
-                    img, err = await self._comfyui(s, self.valves.LLAMASWAP_URL, cfg, prompt, neg, w, h, steps, seed, __event_emitter__)
+                    raw, err = await self._comfyui(s, self.valves.LLAMASWAP_URL, cfg, prompt, neg, w, h, steps, seed, __event_emitter__)
+                if raw and not err:
+                    src, warn = await self._deliver(s, raw, prompt, __request__, __metadata__)
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
 
-        if err or not img:
+        if err or not src:
             await self._emit(__event_emitter__, f"Failed: {err}", done=True)
             return f"⚠️ Image generation failed: {err or 'no image'}"
-        await self._emit(__event_emitter__, f"Generated in {int(time.time() - t0)}s ({steps} steps, {w}x{h})", done=True)
-        # Return as an inline data URI. (Saving to Open WebUI's /api/v1/files store was
-        # tried but that endpoint runs a document-processing pipeline that hangs on images;
-        # the chat itself is the gallery, which is what "saved like chats" means.)
-        return f"![{prompt[:60]}](data:image/png;base64,{img})"
+        status = f"Generated in {int(time.time() - t0)}s ({steps} steps, {w}x{h})"
+        await self._emit(__event_emitter__, f"{status} -- {warn}" if warn else status, done=True)
+        # src is normally an Open WebUI file-store URL; the chat stores the link, not
+        # the pixels, so a long image chat stays light. It falls back to a data URI.
+        # Square brackets / newlines in the prompt would break the markdown, so the
+        # alt text is stripped of them rather than trusted verbatim.
+        alt = re.sub(r"[\[\]\r\n]+", " ", prompt)[:60].strip()
+        return f"![{alt}]({src})"
