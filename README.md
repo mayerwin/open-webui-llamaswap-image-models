@@ -1,6 +1,6 @@
 # Open WebUI image models via llama-swap
 
-Add image-generation models to [Open WebUI](https://github.com/open-webui/open-webui) as **selectable entries in the model dropdown**. Pick one, type a prompt, get an image in the chat. Each model is routed to the right backend **through [llama-swap](https://github.com/mostlygeek/llama-swap)**, so a single GPU is shared safely between your chat LLMs and your image models (llama-swap loads one model at a time, so no out-of-memory).
+Add image-generation models to [Open WebUI](https://github.com/open-webui/open-webui) as **selectable entries in the model dropdown**. Pick one, type a prompt (and optionally attach a reference image for Image-to-Image), get an image or video in the chat. Each model is routed to the right backend **through [llama-swap](https://github.com/mostlygeek/llama-swap)**, so a single GPU is shared safely between your chat LLMs and your image models (llama-swap loads one model at a time, so no out-of-memory).
 
 ![Model selector](screenshots/model-selector.png)
 
@@ -8,27 +8,29 @@ This is a single Open WebUI **Function** (a manifold "pipe"). No fork, no extra 
 
 ## Why
 
-Open WebUI's built-in image generation targets one global model at a time, and you cannot choose the model per chat. If you serve several image models behind llama-swap (FLUX, Qwen-Image, HiDream, an Ideogram-style HTTP backend, and so on), this function exposes each of them as its own selectable model and routes the request to the correct backend. Your chat history becomes your gallery.
+Open WebUI's built-in image generation targets one global model at a time, and you cannot choose the model per chat. If you serve several image models behind llama-swap (FLUX, Qwen-Image, HiDream, SDXL, an Ideogram-style HTTP backend, and so on), this function exposes each of them as its own selectable model and routes the request to the correct backend. Your chat history becomes your gallery.
 
 ## How it works
 
 ```
-you pick a model + prompt
+you pick a model + prompt (and optional input image)
         |
         v
    Open WebUI  --(this function)-->  llama-swap  -->  the right backend
                                                   |
-                                                  +-- ComfyUI (builds a workflow)
+                                                  +-- ComfyUI (builds workflow from template)
                                                   |     POST /upstream/<name>/prompt
+                                                  |     POST /upstream/<name>/upload/image (img2img)
                                                   |
                                                   +-- OpenAI-style image API
                                                         POST /upstream/<name>/v1/images/generations
 ```
 
-- **`comfyui` backend**: the function builds a ComfyUI prompt graph from a built-in template (`flux2`, `qwen_image`, `hidream`, `sdxl`), posts it to `<llama-swap>/upstream/<name>/prompt`, polls `/history`, and fetches the image from `/view`.
+- **`comfyui` backend**: the function builds a ComfyUI prompt graph from a built-in template (`flux2`, `qwen_image`, `hidream`, `sdxl`, `sdxl_img2img`, `flux2_img2img`) or a custom inline workflow, posts it to `<llama-swap>/upstream/<name>/prompt`, polls `/history`, and fetches the image/video from `/view`.
+- **Image-to-Image (img2img)**: if an image is attached to the chat message, it is automatically uploaded to ComfyUI via `/upload/image` and fed into the workflow's image input node.
 - **`openai` backend**: the function posts `{prompt, size}` to `<llama-swap>/upstream/<name>/v1/images/generations` (any OpenAI-images-compatible server behind llama-swap).
 
-The finished image is uploaded to Open WebUI's own file store and the chat gets a link to it (`/api/v1/files/<id>/content`). The link is relative, so the browser fetches the image from Open WebUI itself and it works even when the browser cannot reach llama-swap directly. Your chat history is the gallery.
+The finished image or video is uploaded to Open WebUI's own file store and the chat gets a link to it (`/api/v1/files/<id>/content`). The link is relative, so the browser fetches the media from Open WebUI itself and it works even when the browser cannot reach llama-swap directly. Your chat history is the gallery.
 
 ## Requirements
 
@@ -66,7 +68,7 @@ In Open WebUI go to **Admin Panel** > **Functions** > your function > the **gear
 - **`WEBUI_URL`**: base URL of this Open WebUI, used to upload the generated image to its file store. Leave empty to auto-detect it from the incoming request; set it if your Open WebUI sits behind a proxy that rewrites the host.
 - **`INLINE_IMAGES`**: return the image as a base64 data URI instead of a file-store link (off by default). Needs no auth, but see the note below on why it makes chats slow.
 
-Each `MODELS_JSON` entry looks like this:
+Each `MODELS_JSON` entry can use a built-in template:
 
 ```json
 {
@@ -96,8 +98,9 @@ Field by field:
 | `icon` | optional prefix (any emoji or text) |
 | `backend` | `comfyui` or `openai` |
 | `upstream` | the llama-swap model name to route to |
-| `template` | `comfyui` only: `flux2`, `qwen_image`, `hidream`, or `sdxl` |
-| `files` | `comfyui` only: the file names ComfyUI loads (keys depend on the template) |
+| `template` | `comfyui` only: built-in name (`flux2`, `qwen_image`, `hidream`, `sdxl`, `sdxl_img2img`, `flux2_img2img`) |
+| `workflow` | `comfyui` only: optional inline custom API prompt JSON (overrides `template`) |
+| `files` | `comfyui` only: the file names ComfyUI loads (keys match template or `{{files.<key>}}`) |
 | `steps`, `guidance` | `comfyui` only: defaults for this model |
 | `description` | shown on the model's splash screen |
 
@@ -107,7 +110,64 @@ An `openai` backend entry is just the routing:
 { "id": "ideogram", "name": "Ideogram 4", "icon": "🎨", "backend": "openai", "upstream": "ideogram-4" }
 ```
 
-The built-in templates (`flux2`, `qwen_image`, `hidream`, `sdxl`) cover common ComfyUI graphs. `sdxl` is the stock single-checkpoint graph (`files: {"ckpt": "..."}`) and works for SD 1.5 / SDXL / any checkpoint that bundles unet+clip+vae. For a different model family, add a builder function near the top of the source and reference it by name from `template`.
+---
+
+## Dynamic ComfyUI Workflows & Custom Templates
+
+Instead of modifying Python code, you can define **custom ComfyUI workflows directly in `MODELS_JSON`** using the `"workflow"` key with template placeholders.
+
+Example custom workflow in `MODELS_JSON`:
+
+```json
+{
+  "id": "my-custom-model",
+  "name": "Custom LoRA Model",
+  "icon": "🎨",
+  "backend": "comfyui",
+  "upstream": "comfyui",
+  "workflow": {
+    "4": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "{{files.ckpt}}"}},
+    "6": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["4", 1], "text": "{{prompt}}"}},
+    "7": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["4", 1], "text": "{{negative}}"}},
+    "5": {"class_type": "EmptyLatentImage", "inputs": {"width": "{{width}}", "height": "{{height}}", "batch_size": 1}},
+    "41": {"class_type": "KSampler", "inputs": {"model": ["4", 0], "positive": ["6", 0], "negative": ["7", 0], "latent_image": ["5", 0], "seed": "{{seed}}", "steps": "{{steps}}", "cfg": "{{guidance}}", "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0}},
+    "42": {"class_type": "VAEDecode", "inputs": {"samples": ["41", 0], "vae": ["4", 2]}},
+    "43": {"class_type": "SaveImage", "inputs": {"images": ["42", 0], "filename_prefix": "owui"}}
+  },
+  "files": {"ckpt": "my_checkpoint.safetensors"},
+  "steps": 25,
+  "guidance": 6.5
+}
+```
+
+### Available Template Placeholders
+
+| Placeholder | Replaced with | Example output |
+| :--- | :--- | :--- |
+| `{{prompt}}` | User prompt text | `"a red fox in a forest"` |
+| `{{negative}}` | Negative prompt (`--neg` or default) | `"blurry, low quality"` |
+| `{{width}}`, `{{height}}` | Resolution in pixels (clamped to multiples of 8) | `1024` (int) |
+| `{{steps}}` | Sampling steps (`--steps` or model default) | `20` (int) |
+| `{{seed}}` | Random or explicit seed (`--seed`) | `42` (int) |
+| `{{guidance}}` / `{{cfg}}` | Guidance / CFG scale | `3.5` (float) |
+| `{{denoise}}` | Denoising strength for img2img (`--denoise` or default 0.7) | `0.7` (float) |
+| `{{input_image}}` | Filename of the uploaded image in ComfyUI | `"input-1724500000.png"` |
+| `{{files.<key>}}` | Looked up from the model's `"files"` dictionary | `files["unet"]` |
+
+---
+
+## Source Workflows & GUI Files
+
+Full exportable GUI `.json` workflows are included in the [`workflows/`](workflows/) directory:
+- [`workflows/sdxl.json`](workflows/sdxl.json) (Stock SD/SDXL)
+- [`workflows/sdxl_img2img.json`](workflows/sdxl_img2img.json) (SDXL Image-to-Image)
+- [`workflows/flux2.json`](workflows/flux2.json) (FLUX.2 GGUF)
+- [`workflows/qwen_image.json`](workflows/qwen_image.json) (Qwen-Image GGUF)
+- [`workflows/hidream.json`](workflows/hidream.json) (HiDream-O1)
+
+Drag and drop any of these into your ComfyUI browser interface to inspect nodes or install missing custom nodes automatically via [ComfyUI-Manager](https://github.com/ltdrdata/ComfyUI-Manager). See [`workflows/README.md`](workflows/README.md) for full details.
+
+---
 
 ### Make ComfyUI actually free the GPU (recommended)
 
@@ -172,19 +232,27 @@ Disable Open WebUI's built-in image toggle so it does not compete with these mod
 
 ## Use
 
+### Text to Image
 Pick a model in the dropdown, type a description, and send. Optional inline flags in the prompt:
 
 ```
 a red fox in a snowy forest --steps 30 --size 1216x832 --seed 7 --neg "blurry, low quality"
 ```
 
-Or set per-user defaults in the function's UserValves (width, height, steps, seed, negative).
+### Image to Image (img2img)
+Attach an image to your message in Open WebUI, pick an image model (like SDXL or FLUX), describe how you want to modify or transform it, and optionally adjust `--denoise`:
+
+```
+oil painting style, vibrant impressionist strokes --denoise 0.65
+```
+
+Or set per-user defaults in the function's UserValves (width, height, steps, seed, denoise, negative).
 
 ## Notes and troubleshooting
 
 - **Open WebUI may run Python older than 3.12.** There, a backslash inside an f-string expression is a `SyntaxError`, and it crashes the function load with HTTP 400. If you edit the source, keep escapes (like the emoji) in module constants, never inline in an f-string. This repo already follows that rule.
 - **Heavy models are slow.** A large diffusion model on a modest GPU can take many minutes per image; the function streams a "rendering... Ns" status while it waits. Raise `TIMEOUT_S` if a model needs longer.
-- **Images go to Open WebUI's file store, not into the chat as base64.** A data URI is re-sent with the whole conversation on every later message, so a chat with a few images becomes slow to load and unpleasant to keep talking in. Two details make the upload work, and both were dead ends at first: the route needs the **trailing slash** (`POST /api/v1/files/` — without it the request matches the `GET` listing and returns 405), and it needs **`?process=false`** to skip the document-extraction pipeline, which is what hangs on an image. Credit to [@jamilnielsen](https://github.com/mayerwin/open-webui-llamaswap-image-models/issues/2) for finding this.
+- **Images go to Open WebUI's file store, not into the chat as base64.** A data URI is re-sent with the whole conversation on every later message, so a chat with a few images becomes slow to load and unpleasant to keep talking in. Two details make the upload work: the route needs the **trailing slash** (`POST /api/v1/files/` — without it the request matches the `GET` listing and returns 405), and it needs **`?process=false`** to skip the document-extraction pipeline, which is what hangs on an image. Credit to [@jamilnielsen](https://github.com/mayerwin/open-webui-llamaswap-image-models/issues/2) for finding this.
 - **If the upload fails, the image is not lost.** The function falls back to an inline data URI and says so in the status line. Set `INLINE_IMAGES` to make that the permanent behaviour.
 - **Generated images accumulate in Open WebUI's upload folder.** That is the trade-off for fast chats; prune it if disk matters.
 - **Several images at once in one chat.** Sending a new prompt while one is still rendering can abandon the in-flight render — an Open WebUI limitation this function cannot work around. Use separate chats for parallel requests.
