@@ -497,19 +497,31 @@ class Pipe:
                 await self._emit(emitter, f"rendering on the GPU... {int(time.time() - t0)}s")
                 continue
             if pid in hist:
+                status_obj = hist[pid].get("status", {})
+                if isinstance(status_obj, dict) and status_obj.get("status_str") == "error":
+                    messages = status_obj.get("messages", [])
+                    err_msg = "ComfyUI execution error"
+                    for m in messages:
+                        if isinstance(m, list) and len(m) > 1 and m[0] == "execution_error":
+                            err_msg = m[1].get("exception_message") or str(m[1])
+                            break
+                    return None, None, err_msg[:300]
+
                 outs = hist[pid].get("outputs", {})
                 media_items = self._collect_media(outs)
-                if not media_items:
-                    return None, None, str(hist[pid].get("status", "no image/video produced"))[:200]
-                item = media_items[0]
-                q = urlencode({"filename": item["filename"], "subfolder": item.get("subfolder", ""), "type": item.get("type", "output")})
-                async with s.get(f"{up}/view?{q}") as vr:
-                    if vr.status != 200:
-                        return None, None, f"ComfyUI /view {vr.status} for {item['filename']}"
-                    raw = await vr.read()
-                if not raw:
-                    return None, None, "ComfyUI returned empty output"
-                return raw, item["filename"], None
+                if media_items:
+                    item = media_items[0]
+                    q = urlencode({"filename": item["filename"], "subfolder": item.get("subfolder", ""), "type": item.get("type", "output")})
+                    async with s.get(f"{up}/view?{q}") as vr:
+                        if vr.status != 200:
+                            return None, None, f"ComfyUI /view {vr.status} for {item['filename']}"
+                        raw = await vr.read()
+                    if not raw:
+                        return None, None, "ComfyUI returned empty output"
+                    return raw, item["filename"], None
+
+                if isinstance(status_obj, dict) and status_obj.get("completed") is True:
+                    return None, None, "Workflow completed but produced no image/video output"
             await self._emit(emitter, f"rendering on the GPU... {int(time.time() - t0)}s")
 
         # timed out: best-effort cancel
