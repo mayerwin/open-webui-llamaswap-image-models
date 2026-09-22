@@ -138,6 +138,74 @@ class TestPipe(unittest.TestCase):
         asyncio.run(_run())
 
 
+    def test_extract_multiple_input_images_ordered_and_deduped(self):
+        a = base64.b64encode(b"AAA_first_image").decode()
+        b = base64.b64encode(b"BBB_second_image").decode()
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "blend these"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{a}"}},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b}"}},
+                        # Same reference twice: Open WebUI can deliver one attachment via both
+                        # transports, and a duplicate would silently shift every later index.
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{a}"}},
+                    ],
+                }
+            ]
+        }
+
+        async def _run():
+            imgs = await Pipe._extract_input_images(body, None, None, None)
+            self.assertEqual(len(imgs), 2)
+            self.assertEqual(imgs[0][0], b"AAA_first_image")
+            self.assertEqual(imgs[1][0], b"BBB_second_image")
+            self.assertNotEqual(imgs[0][1], imgs[1][1])
+
+        asyncio.run(_run())
+
+    def test_single_image_accessor_still_returns_first(self):
+        a = base64.b64encode(b"only_one").decode()
+        body = {"messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{a}"}}]}]}
+
+        async def _run():
+            raw, fname = await Pipe._extract_input_image(body, None, None, None)
+            self.assertEqual(raw, b"only_one")
+            self.assertTrue(fname.endswith(".png"))
+
+        asyncio.run(_run())
+
+    def test_render_template_indexed_input_images(self):
+        graph = {
+            "1": {"class_type": "LoadImage", "inputs": {"image": "{{input_image_1}}"}},
+            "2": {"class_type": "LoadImage", "inputs": {"image": "{{input_image_2}}"}},
+            "3": {"class_type": "LoadImage", "inputs": {"image": "{{input_image}}"}},
+            "4": {"class_type": "Note", "inputs": {"text": "using {{input_image_2}} as style"}},
+            "5": {"class_type": "Count", "inputs": {"n": "{{input_image_count}}"}},
+        }
+        ctx = {"input_image": "subject.png",
+               "input_images": ["subject.png", "style.png"],
+               "input_image_count": 2}
+        r = Pipe._render_template(graph, ctx)
+        self.assertEqual(r["1"]["inputs"]["image"], "subject.png")
+        self.assertEqual(r["2"]["inputs"]["image"], "style.png")
+        self.assertEqual(r["3"]["inputs"]["image"], "subject.png")
+        self.assertEqual(r["4"]["inputs"]["text"], "using style.png as style")
+        self.assertEqual(r["5"]["inputs"]["n"], 2)
+        self.assertIsInstance(r["5"]["inputs"]["n"], int)
+
+    def test_missing_second_image_fails_loudly(self):
+        # Silently reusing image 1 would render a plausible but WRONG result (a face swap
+        # using the same face twice), so this must raise rather than degrade.
+        graph = {"2": {"class_type": "LoadImage", "inputs": {"image": "{{input_image_2}}"}}}
+        ctx = {"input_image": "only.png", "input_images": ["only.png"], "input_image_count": 1}
+        with self.assertRaises(ValueError) as cm:
+            Pipe._render_template(graph, ctx)
+        self.assertIn("at least 2", str(cm.exception))
+
 class TestMockE2E(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.pipe = Pipe()
@@ -231,6 +299,119 @@ class TestMockE2E(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(prompts_received[1]["1"]["inputs"]["image"], "uploaded_test.png")
             self.assertEqual(prompts_received[1]["2"]["inputs"]["denoise"], 0.6)
 
+        finally:
+            await runner.cleanup()
+
+
+class TestMultiImageE2E(unittest.IsolatedAsyncioTestCase):
+    """End-to-end for issue #3: a ComfyUI workflow that takes two source images."""
+
+    async def asyncSetUp(self):
+        self.pipe = Pipe()
+        self.pipe.valves.INLINE_IMAGES = True
+
+    async def test_two_source_images_reach_the_right_nodes(self):
+        app = web.Application()
+        uploaded = []
+        prompts_received = []
+
+        async def handle_upload(request):
+            reader = await request.multipart()
+            field = await reader.next()
+            data = await field.read()
+            uploaded.append(data)
+            # A distinct server-side name per upload, as real ComfyUI gives.
+            return web.json_response(
+                {"name": f"comfy_{len(uploaded)}.png", "subfolder": "", "type": "input"})
+
+        async def handle_prompt(request):
+            data = await request.json()
+            prompts_received.append(data["prompt"])
+            return web.json_response({"prompt_id": "multi-1"})
+
+        async def handle_history(request):
+            return web.json_response({"multi-1": {"outputs": {
+                "99": {"images": [{"filename": "blended.png", "subfolder": "", "type": "output"}]}}}})
+
+        async def handle_view(request):
+            return web.Response(body=bytes([0x89]) + b"PNG_blended", content_type="image/png")
+
+        app.router.add_post("/upstream/comfyui/upload/image", handle_upload)
+        app.router.add_post("/upstream/comfyui/prompt", handle_prompt)
+        app.router.add_get("/upstream/comfyui/history/multi-1", handle_history)
+        app.router.add_get("/upstream/comfyui/view", handle_view)
+
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 18889)
+        await site.start()
+        self.pipe.valves.LLAMASWAP_URL = "http://127.0.0.1:18889"
+
+        try:
+            self.pipe.valves.MODELS_JSON = json.dumps([{
+                "id": "two-image-blend",
+                "name": "Two Image Blend",
+                "backend": "comfyui",
+                "upstream": "comfyui",
+                "workflow": {
+                    "1": {"class_type": "LoadImage", "inputs": {"image": "{{input_image_1}}"}},
+                    "2": {"class_type": "LoadImage", "inputs": {"image": "{{input_image_2}}"}},
+                    "3": {"class_type": "ImageBlend", "inputs": {"a": ["1", 0], "b": ["2", 0]}},
+                    "4": {"class_type": "SaveImage", "inputs": {"filename_prefix": "owui"}},
+                },
+            }])
+
+            subject = base64.b64encode(b"SUBJECT_PIXELS").decode()
+            style = base64.b64encode(b"STYLE_PIXELS").decode()
+            body = {"model": "two-image-blend", "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "blend subject with style"},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{subject}"}},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{style}"}}]}]}
+
+            res = await self.pipe.pipe(body)
+
+            self.assertTrue(res.startswith("![blend subject with style](data:image/png;base64,"))
+            # BOTH images uploaded, in the order the user attached them.
+            self.assertEqual(len(uploaded), 2)
+            self.assertEqual(uploaded[0], b"SUBJECT_PIXELS")
+            self.assertEqual(uploaded[1], b"STYLE_PIXELS")
+            # ...and each landed in its own LoadImage node, not the same one twice.
+            graph = prompts_received[0]
+            self.assertEqual(graph["1"]["inputs"]["image"], "comfy_1.png")
+            self.assertEqual(graph["2"]["inputs"]["image"], "comfy_2.png")
+        finally:
+            await runner.cleanup()
+
+    async def test_workflow_needing_two_images_errors_when_given_one(self):
+        # Needs a live mock upload endpoint, otherwise the upload fails first and we would
+        # be asserting on a connection error instead of the behaviour under test.
+        app = web.Application()
+
+        async def handle_upload(request):
+            reader = await request.multipart()
+            field = await reader.next()
+            await field.read()
+            return web.json_response({"name": "comfy_1.png", "subfolder": "", "type": "input"})
+
+        app.router.add_post("/upstream/comfyui/upload/image", handle_upload)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 18890)
+        await site.start()
+        self.pipe.valves.LLAMASWAP_URL = "http://127.0.0.1:18890"
+
+        try:
+            self.pipe.valves.MODELS_JSON = json.dumps([{
+                "id": "needs-two", "name": "Needs Two", "backend": "comfyui", "upstream": "comfyui",
+                "workflow": {"2": {"class_type": "LoadImage", "inputs": {"image": "{{input_image_2}}"}}},
+            }])
+            one = base64.b64encode(b"ONLY_ONE").decode()
+            body = {"model": "needs-two", "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "go"},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{one}"}}]}]}
+            res = await self.pipe.pipe(body)
+            self.assertIn("failed", res.lower())
+            self.assertIn("at least 2", res)
         finally:
             await runner.cleanup()
 

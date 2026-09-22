@@ -151,8 +151,36 @@ Example custom workflow in `MODELS_JSON`:
 | `{{seed}}` | Random or explicit seed (`--seed`) | `42` (int) |
 | `{{guidance}}` / `{{cfg}}` | Guidance / CFG scale | `3.5` (float) |
 | `{{denoise}}` | Denoising strength for img2img (`--denoise` or default 0.7) | `0.7` (float) |
-| `{{input_image}}` | Filename of the uploaded image in ComfyUI | `"input-1724500000.png"` |
+| `{{input_image}}` | Filename of the **first** uploaded image in ComfyUI | `"input-1724500000-0.png"` |
+| `{{input_image_1}}`, `{{input_image_2}}`, ... | Nth attached image, **1-based**, in the order the user attached them. `{{input_image_1}}` is the same as `{{input_image}}`. | `"input-1724500000-1.png"` |
+| `{{input_image_count}}` | How many images the user attached | `2` (int) |
 | `{{files.<key>}}` | Looked up from the model's `"files"` dictionary | `files["unet"]` |
+
+### Workflows that take several source images
+
+Attach more than one image to the message and reference them by index. Order follows the
+order you attached them, so the first image is `{{input_image_1}}`:
+
+```json
+{
+  "id": "blend", "name": "Blend Two", "backend": "comfyui", "upstream": "comfyui",
+  "workflow": {
+    "1": {"class_type": "LoadImage",  "inputs": {"image": "{{input_image_1}}"}},
+    "2": {"class_type": "LoadImage",  "inputs": {"image": "{{input_image_2}}"}},
+    "3": {"class_type": "ImageBlend", "inputs": {"image1": ["1", 0], "image2": ["2", 0], "blend_factor": 0.5}},
+    "4": {"class_type": "SaveImage",  "inputs": {"images": ["3", 0], "filename_prefix": "owui"}}
+  }
+}
+```
+
+There is no fixed limit; use as many indices as your graph needs.
+
+If the workflow references an image you did not attach (say `{{input_image_2}}` with only one
+attached), generation **fails with an explicit message** rather than quietly reusing the first
+image. That is deliberate: silently reusing it would produce a plausible-looking but wrong
+result, such as a face swap that used the same face twice.
+
+Single-image workflows are unaffected: `{{input_image}}` keeps working exactly as before.
 
 ---
 

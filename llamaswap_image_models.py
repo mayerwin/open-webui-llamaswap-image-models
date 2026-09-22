@@ -265,6 +265,11 @@ class Pipe:
             return float(ctx.get("denoise", 0.7))
         if val == "{{input_image}}":
             return str(ctx.get("input_image") or "input.png")
+        if val == "{{input_image_count}}":
+            return int(ctx.get("input_image_count", 0))
+        m_img = re.fullmatch(r"\{\{input_image_(\d+)\}\}", val)
+        if m_img:
+            return Pipe._nth_input_image(ctx, int(m_img.group(1)))
 
         # Nested {{files.<key>}} exact substitution
         m_file = re.fullmatch(r"\{\{files\.([\w\.\-]+)\}\}", val)
@@ -279,9 +284,28 @@ class Pipe:
             if k.startswith("files."):
                 fkey = k[6:]
                 return str((ctx.get("files") or {}).get(fkey, ""))
+            m_i = re.fullmatch(r"input_image_(\d+)", k)
+            if m_i:
+                return str(Pipe._nth_input_image(ctx, int(m_i.group(1))))
             return str(ctx.get(k, ""))
 
         return re.sub(r"\{\{([\w\.\-]+)\}\}", _sub, template_obj)
+
+    @staticmethod
+    def _nth_input_image(ctx, n):
+        # 1-based. Deliberately RAISES when the workflow asks for an image the user did not
+        # attach: silently falling back to image 1 would render a plausible-looking but
+        # wrong result (e.g. a face swap using the same face twice), which is far worse
+        # than an explicit error.
+        names = ctx.get("input_images") or []
+        if n < 1:
+            raise ValueError("{{input_image_%d}} is invalid; image placeholders are 1-based" % n)
+        if n > len(names):
+            raise ValueError(
+                "this workflow needs at least %d input image(s) but %d %s attached -- "
+                "attach %d image(s) to the message"
+                % (n, len(names), "was" if len(names) == 1 else "were", n))
+        return str(names[n - 1])
 
     @staticmethod
     def _collect_media(outputs):
@@ -325,53 +349,56 @@ class Pipe:
         return (c or "").strip()
 
     @classmethod
-    async def _extract_input_image(cls, body, request, s, webui_url):
-        # Extracts user-attached images from the last message in Open WebUI.
+    def _collect_input_image_refs(cls, body):
+        # Ordered list of every image reference on the last user message.
+        # Open WebUI can deliver the same attachment through BOTH transports (inline
+        # `image_url` content parts and the `files` array), so dedupe by reference while
+        # preserving order -- order is what maps an image onto {{input_image_N}}.
         msg = cls._last_user_message(body)
         if not msg:
-            return None, None
-
-        img_url = None
+            return []
+        refs = []
         c = msg.get("content")
         if isinstance(c, list):
             for part in c:
                 if isinstance(part, dict) and part.get("type") == "image_url":
-                    img_info = part.get("image_url")
-                    if isinstance(img_info, dict) and img_info.get("url"):
-                        img_url = img_info["url"]
-                        break
-                    if isinstance(img_info, str):
-                        img_url = img_info
-                        break
+                    info = part.get("image_url")
+                    if isinstance(info, dict) and info.get("url"):
+                        refs.append(info["url"])
+                    elif isinstance(info, str):
+                        refs.append(info)
+        files = msg.get("files") or body.get("files") or []
+        if isinstance(files, list):
+            for f in files:
+                if not isinstance(f, dict):
+                    continue
+                furl = f.get("url") or f.get("file_path") or f.get("id")
+                if not furl:
+                    continue
+                refs.append(str(furl) if str(furl).startswith(("/", "http"))
+                            else f"/api/v1/files/{furl}/content")
+        seen, out = set(), []
+        for r in refs:
+            if r not in seen:
+                seen.add(r)
+                out.append(r)
+        return out
 
-        # Also check msg.get("files") or body.get("files")
-        if not img_url:
-            files = msg.get("files") or body.get("files") or []
-            if isinstance(files, list):
-                for f in files:
-                    if isinstance(f, dict):
-                        furl = f.get("url") or f.get("file_path") or f.get("id")
-                        if furl:
-                            img_url = f"/api/v1/files/{furl}/content" if not str(furl).startswith(("/", "http")) else str(furl)
-                            break
-
-        if not img_url:
-            return None, None
-
-        # 1. Base64 data URI
-        if img_url.startswith("data:image/"):
+    @classmethod
+    async def _fetch_image_ref(cls, ref, request, s, webui_url, index=0):
+        # Resolves one reference to (bytes, filename). Returns (None, None) on failure.
+        if ref.startswith("data:image/"):
             try:
-                header, b64 = img_url.split(",", 1)
+                header, b64 = ref.split(",", 1)
                 ext = "png"
                 if "jpeg" in header or "jpg" in header:
                     ext = "jpg"
                 elif "webp" in header:
                     ext = "webp"
-                return base64.b64decode(b64), f"input-{int(time.time())}.{ext}"
+                return base64.b64decode(b64), f"input-{int(time.time())}-{index}.{ext}"
             except Exception:
                 return None, None
 
-        # 2. Open WebUI internal file or HTTP URL
         base = (webui_url or "").rstrip("/")
         if not base and request is not None:
             try:
@@ -379,23 +406,36 @@ class Pipe:
             except Exception:
                 base = ""
 
-        fetch_url = img_url
-        if img_url.startswith("/"):
+        fetch_url = ref
+        if ref.startswith("/"):
             if not base:
                 return None, None
-            fetch_url = base + img_url
+            fetch_url = base + ref
 
         try:
             headers = cls._auth_headers(request)
             async with s.get(fetch_url, headers=headers) as r:
                 if r.status == 200:
-                    raw = await r.read()
-                    filename = f"input-{int(time.time())}.png"
-                    return raw, filename
+                    return await r.read(), f"input-{int(time.time())}-{index}.png"
         except Exception:
             pass
-
         return None, None
+
+    @classmethod
+    async def _extract_input_images(cls, body, request, s, webui_url):
+        # ALL attached images, in order, as a list of (bytes, filename).
+        out = []
+        for idx, ref in enumerate(cls._collect_input_image_refs(body)):
+            raw, fname = await cls._fetch_image_ref(ref, request, s, webui_url, idx)
+            if raw:
+                out.append((raw, fname))
+        return out
+
+    @classmethod
+    async def _extract_input_image(cls, body, request, s, webui_url):
+        # Backward-compatible single-image accessor (first attachment).
+        imgs = await cls._extract_input_images(body, request, s, webui_url)
+        return imgs[0] if imgs else (None, None)
 
     @staticmethod
     def _parse_params(prompt, uv, cfg):
@@ -446,7 +486,7 @@ class Pipe:
             data = await r.json()
             return data.get("name") or filename, None
 
-    async def _comfyui(self, s, base, cfg, prompt, neg, w, h, steps, seed, denoise, input_image_name, emitter):
+    async def _comfyui(self, s, base, cfg, prompt, neg, w, h, steps, seed, denoise, input_image_names, emitter):
         # Determine graph: inline custom workflow, or built-in template
         custom_wf = cfg.get("workflow") or (cfg.get("template") if isinstance(cfg.get("template"), dict) else None)
         if custom_wf:
@@ -460,21 +500,23 @@ class Pipe:
                 "guidance": cfg.get("guidance", 3.5),
                 "cfg": cfg.get("guidance", 3.5),
                 "denoise": denoise,
-                "input_image": input_image_name or "input.png",
+                "input_image": (input_image_names[0] if input_image_names else "input.png"),
+                "input_images": list(input_image_names or []),
+                "input_image_count": len(input_image_names or []),
                 "files": cfg.get("files") or {},
             }
             graph = self._render_template(custom_wf, ctx)
         else:
             tmpl_name = cfg.get("template")
             # Auto-switch to img2img template if an image is provided and a corresponding template exists
-            if input_image_name and tmpl_name in ("sdxl", "flux2"):
+            if input_image_names and tmpl_name in ("sdxl", "flux2"):
                 tmpl_name = f"{tmpl_name}_img2img"
 
             builder = TEMPLATES.get(tmpl_name)
             if not builder:
                 return None, None, f"unknown template '{cfg.get('template')}'"
             try:
-                graph = builder(cfg.get("files") or {}, prompt, neg, w, h, steps, cfg.get("guidance", 3.5), seed, denoise=denoise, input_image=input_image_name)
+                graph = builder(cfg.get("files") or {}, prompt, neg, w, h, steps, cfg.get("guidance", 3.5), seed, denoise=denoise, input_image=(input_image_names[0] if input_image_names else None))
             except TypeError:
                 # Older builder signature fallback
                 graph = builder(cfg.get("files") or {}, prompt, neg, w, h, steps, cfg.get("guidance", 3.5), seed)
@@ -669,20 +711,28 @@ class Pipe:
             timeout = aiohttp.ClientTimeout(total=self.valves.TIMEOUT_S + 120)
             async with aiohttp.ClientSession(timeout=timeout) as s:
                 # Check for attached input image for img2img / img2vid
-                input_bytes, in_fname = await self._extract_input_image(body, __request__, s, self.valves.WEBUI_URL)
-                input_image_name = None
-                if input_bytes and cfg.get("backend") != "openai":
-                    await self._emit(__event_emitter__, "Uploading reference image to ComfyUI...")
-                    input_image_name, uperr = await self._upload_input_image_to_comfyui(
-                        s, self.valves.LLAMASWAP_URL, cfg["upstream"], input_bytes, in_fname or "input.png")
-                    if uperr:
-                        await self._emit(__event_emitter__, f"Image upload warning: {uperr}")
+                input_images = await self._extract_input_images(body, __request__, s, self.valves.WEBUI_URL)
+                input_image_names = []
+                if input_images and cfg.get("backend") != "openai":
+                    n = len(input_images)
+                    for idx, (img_bytes, in_fname) in enumerate(input_images, start=1):
+                        await self._emit(
+                            __event_emitter__,
+                            "Uploading reference image to ComfyUI..." if n == 1
+                            else f"Uploading reference image {idx}/{n} to ComfyUI...")
+                        up_name, uperr = await self._upload_input_image_to_comfyui(
+                            s, self.valves.LLAMASWAP_URL, cfg["upstream"], img_bytes,
+                            in_fname or f"input-{idx}.png")
+                        if uperr:
+                            await self._emit(__event_emitter__, f"Image upload warning: {uperr}")
+                        if up_name:
+                            input_image_names.append(up_name)
 
                 if cfg.get("backend") == "openai":
                     raw, filename, err = await self._openai(s, self.valves.LLAMASWAP_URL, cfg, prompt, w, h, seed)
                 else:
                     raw, filename, err = await self._comfyui(
-                        s, self.valves.LLAMASWAP_URL, cfg, prompt, neg, w, h, steps, seed, denoise, input_image_name, __event_emitter__)
+                        s, self.valves.LLAMASWAP_URL, cfg, prompt, neg, w, h, steps, seed, denoise, input_image_names, __event_emitter__)
 
                 if raw and not err:
                     src, is_video, warn = await self._deliver(s, raw, prompt, filename, __request__, __metadata__)
